@@ -412,9 +412,18 @@ async fn handle_connection<L, M, S, B>(
         #[cfg(feature = "http1")]
         builder.http1().timer(TokioTimer::new());
 
-        // CONNECT protocol needed for HTTP/2 websockets
+        // CONNECT protocol needed for HTTP/2 websockets.
+        // Also tune flow-control windows and frame size so that h2c throughput
+        // matches HTTP/1: the default 64 KiB window causes senders to stall
+        // waiting for WINDOW_UPDATE frames, and the default 16 KiB max-frame
+        // size inflates per-byte framing overhead.
         #[cfg(feature = "http2")]
-        builder.http2().enable_connect_protocol();
+        builder
+            .http2()
+            .enable_connect_protocol()
+            .initial_stream_window_size(2 * 1024 * 1024) // 2 MiB per stream
+            .initial_connection_window_size(2 * 1024 * 1024) // 2 MiB per connection
+            .max_frame_size(1024 * 1024); // 1 MiB frames
 
         let mut conn = pin!(builder.serve_connection_with_upgrades(io, hyper_service));
         let mut signal_closed = pin!(signal_tx.closed().fuse());
