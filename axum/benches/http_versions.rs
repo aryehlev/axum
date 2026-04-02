@@ -460,6 +460,104 @@ fn bench_pool(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark 4: warmed connection pool
+//
+// Connections are established ONCE outside the criterion loop and reused
+// across every iteration — exactly how a real connection pool (reqwest,
+// hyper-util's pooled client, etc.) works in production.
+//
+// Two things this eliminates vs bench_pool:
+//   (A) Per-iteration TCP + TLS/SETTINGS handshake overhead.
+//   (B) Cold HPACK dynamic tables: the 99-char Authorization token is
+//       sent verbatim only on the first request; after that it compresses
+//       to a 1-2 byte back-reference.  With 1000 requests and warm tables
+//       the HPACK cost drops ~50x compared to cold-connection pools.
+//
+// http2::SendRequest<B>: Clone — a clone shares the same connection and
+// can independently send concurrent streams (no locking needed).
+// http1::SendRequest<B>: not Clone — connections are sequential; each
+// pre-warmed sender is wrapped in Arc<Mutex<>> for safe multi-task reuse.
+// ---------------------------------------------------------------------------
 
-criterion_group!(benches, bench_warm_latency, bench_persistent, bench_pool);
+fn bench_pool_warm(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    const CONNECTIONS: u64 = 64;
+    const TOTAL: u64 = 1_000;
+    let per: u64 = TOTAL / CONNECTIONS;
+
+    for (label, path, is_post) in [
+        ("get_json",  "/api/users", false),
+        ("post_echo", "/api/echo",  true),
+    ] {
+        let (addr, rt) = start_server();
+        let mut group = c.benchmark_group(format!("pool_warm/{}", label));
+        group.throughput(Throughput::Elements(TOTAL));
+
+        // --- HTTP/1 warmed pool -------------------------------------------
+        // Pre-establish CONNECTIONS senders and wrap in Arc<Mutex> so each
+        // can be borrowed by a spawned task without requiring Clone.
+        let http1_senders: Vec<Arc<Mutex<_>>> = rt.block_on(
+            futures_util::future::join_all(
+                (0..CONNECTIONS).map(|_| async move {
+                    Arc::new(Mutex::new(http1_connect(addr).await))
+                }),
+            ),
+        );
+
+        group.bench_function("http1", |b| {
+            b.iter(|| {
+                rt.block_on(futures_util::future::join_all(
+                    http1_senders.iter().map(|sender| {
+                        let sender = sender.clone();
+                        async move {
+                            let mut s = sender.lock().await;
+                            for _ in 0..per {
+                                if is_post {
+                                    http1_post(&mut s, addr, path).await;
+                                } else {
+                                    http1_get(&mut s, addr, path).await;
+                                }
+                            }
+                        }
+                    }),
+                ))
+            });
+        });
+
+        // --- h2c warmed pool -------------------------------------------------
+        // Clone each sender per iteration: the clone shares the underlying
+        // h2 connection so all 16 cloned senders multiplex streams on the
+        // same TCP connection simultaneously.
+        let h2c_senders: Vec<_> = rt.block_on(
+            futures_util::future::join_all(
+                (0..CONNECTIONS).map(|_| h2c_connect(addr)),
+            ),
+        );
+
+        group.bench_function("h2c", |b| {
+            b.iter(|| {
+                rt.block_on(futures_util::future::join_all(
+                    h2c_senders.iter().map(|sender| {
+                        let mut s = sender.clone(); // shares the connection
+                        async move {
+                            if is_post {
+                                h2c_dispatch_posts(&mut s, addr, path, per).await;
+                            } else {
+                                h2c_dispatch_gets(&mut s, addr, path, per).await;
+                            }
+                        }
+                    }),
+                ))
+            });
+        });
+
+        group.finish();
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+criterion_group!(benches, bench_warm_latency, bench_persistent, bench_pool, bench_pool_warm);
 criterion_main!(benches);
