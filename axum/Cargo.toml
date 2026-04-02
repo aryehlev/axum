@@ -181,7 +181,9 @@ features = [
 anyhow = "1.0"
 axum-extra = { path = "../axum-extra", features = ["typed-header"] }
 axum-macros = { path = "../axum-macros", features = ["__private"] }
-hyper = { version = "1.1.0", features = ["client"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+hyper = { version = "1.1.0", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.4", features = ["tokio", "client", "client-legacy", "http1", "http2"] }
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart"] }
@@ -247,3 +249,8 @@ workspace = true
 [[bench]]
 name = "benches"
 harness = false
+
+[[bench]]
+name = "http_versions"
+harness = false
+required-features = ["http1", "http2"]
