@@ -34,8 +34,6 @@ fn start_server() -> (SocketAddr, Runtime) {
         .unwrap();
     let addr = listener.local_addr().unwrap();
 
-    // Drive the server on the same multi-thread runtime so HTTP/2 WINDOW_UPDATE
-    // frames are processed concurrently with client sends.
     rt.spawn(axum::serve(listener, app).into_future());
 
     (addr, rt)
@@ -45,33 +43,62 @@ fn start_server() -> (SocketAddr, Runtime) {
 // HTTP/1 helpers
 // ---------------------------------------------------------------------------
 
-async fn http1_request(addr: SocketAddr) {
+/// One TCP connect + one request. Measures per-connection overhead.
+async fn http1_single(addr: SocketAddr) {
     let stream = TcpStream::connect(addr).await.unwrap();
     let io = TokioIo::new(stream);
-
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
     tokio::spawn(conn);
 
+    sender.ready().await.unwrap();
     let req = Request::builder()
         .version(Version::HTTP_11)
         .uri("/")
         .header("host", addr.to_string())
         .body(Empty::<Bytes>::new())
         .unwrap();
-
     let resp = sender.send_request(req).await.unwrap();
-    // consume the body so the connection is truly done
     resp.into_body().collect().await.unwrap();
+}
+
+/// N sequential requests on one persistent connection.
+async fn http1_sequential(addr: SocketAddr, n: u64) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(conn);
+
+    for _ in 0..n {
+        // Wait until the connection is ready for the next request.
+        sender.ready().await.unwrap();
+        let req = Request::builder()
+            .version(Version::HTTP_11)
+            .uri("/")
+            .header("host", addr.to_string())
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        resp.into_body().collect().await.unwrap();
+    }
+}
+
+/// N requests across C concurrent connections (simulates a connection pool).
+async fn http1_concurrent(addr: SocketAddr, concurrency: u64, requests: u64) {
+    let futs = (0..concurrency).map(|_| {
+        let per = requests / concurrency;
+        async move { http1_sequential(addr, per).await }
+    });
+    futures_util::future::join_all(futs).await;
 }
 
 // ---------------------------------------------------------------------------
 // h2c helpers
 // ---------------------------------------------------------------------------
 
-async fn h2c_request(addr: SocketAddr) {
+/// One TCP connect + one request over h2c.
+async fn h2c_single(addr: SocketAddr) {
     let stream = TcpStream::connect(addr).await.unwrap();
     let io = TokioIo::new(stream);
-
     let (mut sender, conn) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
             .await
@@ -83,46 +110,20 @@ async fn h2c_request(addr: SocketAddr) {
         .uri(format!("http://{}/", addr))
         .body(Empty::<Bytes>::new())
         .unwrap();
-
     let resp = sender.send_request(req).await.unwrap();
     resp.into_body().collect().await.unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// Pipelined / multiplexed variants: reuse a single connection for N requests
-// ---------------------------------------------------------------------------
-
-async fn http1_pipelined(addr: SocketAddr, n: u64) {
+/// N concurrent streams on one h2c connection (full multiplexing).
+async fn h2c_concurrent_streams(addr: SocketAddr, n: u64) {
     let stream = TcpStream::connect(addr).await.unwrap();
     let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
-    tokio::spawn(conn);
-
-    for _ in 0..n {
-        let req = Request::builder()
-            .version(Version::HTTP_11)
-            .uri("/")
-            .header("host", addr.to_string())
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-
-        let resp = sender.send_request(req).await.unwrap();
-        resp.into_body().collect().await.unwrap();
-    }
-}
-
-async fn h2c_multiplexed(addr: SocketAddr, n: u64) {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let io = TokioIo::new(stream);
-
     let (mut sender, conn) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
             .await
             .unwrap();
     tokio::spawn(conn);
 
-    // HTTP/2 streams are independent; fire them all concurrently and join.
     let futs: Vec<_> = (0..n)
         .map(|_| {
             let req = Request::builder()
@@ -139,8 +140,17 @@ async fn h2c_multiplexed(addr: SocketAddr, n: u64) {
     }
 }
 
+/// N requests across C h2c connections, each carrying N/C concurrent streams.
+async fn h2c_concurrent_connections(addr: SocketAddr, concurrency: u64, requests: u64) {
+    let futs = (0..concurrency).map(|_| {
+        let per = requests / concurrency;
+        async move { h2c_concurrent_streams(addr, per).await }
+    });
+    futures_util::future::join_all(futs).await;
+}
+
 // ---------------------------------------------------------------------------
-// Benchmark: single request per connection (measures connection + handshake)
+// Benchmark: single request per connection (handshake + request cost)
 // ---------------------------------------------------------------------------
 
 fn bench_single_request(c: &mut Criterion) {
@@ -150,34 +160,33 @@ fn bench_single_request(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("http1", |b| {
-        b.iter(|| rt.block_on(http1_request(addr)));
+        b.iter(|| rt.block_on(http1_single(addr)));
     });
-
     group.bench_function("h2c", |b| {
-        b.iter(|| rt.block_on(h2c_request(addr)));
+        b.iter(|| rt.block_on(h2c_single(addr)));
     });
 
     group.finish();
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: N sequential requests over one persistent connection
+// Benchmark: N sequential requests on one persistent connection
 // ---------------------------------------------------------------------------
 
-fn bench_persistent_connection(c: &mut Criterion) {
+fn bench_sequential(c: &mut Criterion) {
     let (addr, rt) = start_server();
 
-    let mut group = c.benchmark_group("persistent_connection");
+    let mut group = c.benchmark_group("sequential_persistent");
 
     for n in [10u64, 100, 1_000] {
         group.throughput(Throughput::Elements(n));
 
         group.bench_with_input(BenchmarkId::new("http1", n), &n, |b, &n| {
-            b.iter(|| rt.block_on(http1_pipelined(addr, n)));
+            b.iter(|| rt.block_on(http1_sequential(addr, n)));
         });
-
         group.bench_with_input(BenchmarkId::new("h2c", n), &n, |b, &n| {
-            b.iter(|| rt.block_on(h2c_multiplexed(addr, n)));
+            // h2c comparison: sequential streams (not multiplexed) to match HTTP/1
+            b.iter(|| rt.block_on(h2c_concurrent_streams(addr, n)));
         });
     }
 
@@ -185,6 +194,50 @@ fn bench_persistent_connection(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark: concurrent requests (HTTP/1 via parallel connections,
+// h2c via parallel streams on one connection)
+// ---------------------------------------------------------------------------
 
-criterion_group!(benches, bench_single_request, bench_persistent_connection);
+fn bench_concurrent(c: &mut Criterion) {
+    let (addr, rt) = start_server();
+
+    // Total requests fixed at 1_000; we vary concurrency.
+    const TOTAL: u64 = 1_000;
+
+    let mut group = c.benchmark_group("concurrent");
+    group.throughput(Throughput::Elements(TOTAL));
+
+    for concurrency in [1u64, 4, 16, 64] {
+        // HTTP/1: open `concurrency` parallel connections, each handling
+        // TOTAL/concurrency sequential requests.
+        group.bench_with_input(
+            BenchmarkId::new("http1_connections", concurrency),
+            &concurrency,
+            |b, &c| {
+                b.iter(|| rt.block_on(http1_concurrent(addr, c, TOTAL)));
+            },
+        );
+
+        // h2c: open `concurrency` connections each multiplexing
+        // TOTAL/concurrency concurrent streams.
+        group.bench_with_input(
+            BenchmarkId::new("h2c_connections", concurrency),
+            &concurrency,
+            |b, &c| {
+                b.iter(|| rt.block_on(h2c_concurrent_connections(addr, c, TOTAL)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+
+criterion_group!(
+    benches,
+    bench_single_request,
+    bench_sequential,
+    bench_concurrent
+);
 criterion_main!(benches);
