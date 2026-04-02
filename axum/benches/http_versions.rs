@@ -128,6 +128,12 @@ const AUTH:       &str = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOi
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const ACCEPT:     &str = "application/json, text/plain, */*";
 
+// Heavy-headers variant: mimics a browser request with cookies + tracing
+// headers.  Exercises HPACK decoding more aggressively (especially relevant
+// for the fast-hpack decoder in the h2 fork).
+const COOKIE: &str = "session=abc123def456ghi789jkl012mno345pqr678stu901vwx234yz; _ga=GA1.2.1234567890.1700000000; _gid=GA1.2.9876543210.1700086400; csrftoken=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB";
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
 fn build_get(version: Version, uri: String, host: &str) -> Request<ReqBody> {
     Request::builder()
         .version(version)
@@ -157,6 +163,30 @@ fn build_post(version: Version, uri: String, host: &str, body: ReqBody) -> Reque
         .header("content-type",    "application/json")
         .header("x-request-id",    "bench-00000000-0000-0000-0000-000000000001")
         .body(body)
+        .unwrap()
+}
+
+/// Same as build_get but with an extra cookie string + tracing headers.
+/// Used to benchmark HPACK decode performance for the h2 fork's fast-hpack.
+fn build_get_heavy(version: Version, uri: String, host: &str) -> Request<ReqBody> {
+    Request::builder()
+        .version(version)
+        .method(Method::GET)
+        .uri(uri)
+        .header("host",              host)
+        .header("user-agent",        USER_AGENT)
+        .header("accept",            ACCEPT)
+        .header("accept-language",   "en-US,en;q=0.9")
+        .header("authorization",     AUTH)
+        .header("cookie",            COOKIE)
+        .header("x-request-id",     "bench-00000000-0000-0000-0000-000000000001")
+        .header("traceparent",       TRACEPARENT)
+        .header("x-b3-traceid",      "4bf92f3577b34da6a3ce929d0e0e4736")
+        .header("x-b3-spanid",       "00f067aa0ba902b7")
+        .header("x-forwarded-for",   "203.0.113.42, 10.0.0.1")
+        .header("x-forwarded-proto", "https")
+        .header("cache-control",     "no-cache")
+        .body(empty_body())
         .unwrap()
 }
 
@@ -199,6 +229,16 @@ async fn http1_get(
 ) {
     sender.ready().await.unwrap();
     let req = build_get(Version::HTTP_11, format!("http://{}{}", addr, path), &addr.to_string());
+    sender.send_request(req).await.unwrap().into_body().collect().await.unwrap();
+}
+
+async fn http1_get_heavy(
+    sender: &mut hyper::client::conn::http1::SendRequest<ReqBody>,
+    addr: SocketAddr,
+    path: &str,
+) {
+    sender.ready().await.unwrap();
+    let req = build_get_heavy(Version::HTTP_11, format!("http://{}{}", addr, path), &addr.to_string());
     sender.send_request(req).await.unwrap().into_body().collect().await.unwrap();
 }
 
@@ -246,6 +286,29 @@ async fn http1_pool_post(addr: SocketAddr, connections: u64, total: u64, path: &
 // ---------------------------------------------------------------------------
 // h2c request runners
 // ---------------------------------------------------------------------------
+
+async fn h2c_dispatch_gets_heavy(
+    sender: &mut hyper::client::conn::http2::SendRequest<ReqBody>,
+    addr: SocketAddr,
+    path: &str,
+    n: u64,
+) {
+    let futs: Vec<_> = (0..n)
+        .map(|_| {
+            let req = build_get_heavy(
+                Version::HTTP_2,
+                format!("http://{}{}", addr, path),
+                &addr.to_string(),
+            );
+            sender.send_request(req)
+        })
+        .collect();
+    futures_util::future::join_all(
+        futs.into_iter()
+            .map(|f| async move { f.await.unwrap().into_body().collect().await.unwrap() }),
+    )
+    .await;
+}
 
 async fn h2c_dispatch_gets(
     sender: &mut hyper::client::conn::http2::SendRequest<ReqBody>,
@@ -558,6 +621,49 @@ fn bench_pool_warm(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark 5: heavy headers — exercises HPACK decode on every request.
+//
+// Uses 12 request headers (cookie, tracing headers, forwarded-for, …) to
+// stress the HPACK decoder.  This is where the h2 fork's fast-hpack feature
+// is intended to help: the zero-alloc arena decoder avoids per-header
+// allocations that dominate when header strings are long or numerous.
+//
+// Cold connections only (new connection per iteration) so that the HPACK
+// dynamic table is always cold and every header must be fully decoded.
+// ---------------------------------------------------------------------------
 
-criterion_group!(benches, bench_warm_latency, bench_persistent, bench_pool, bench_pool_warm);
+fn bench_heavy_headers(c: &mut Criterion) {
+    let (addr, rt) = start_server();
+    let mut group = c.benchmark_group("heavy_headers");
+    group.throughput(Throughput::Elements(100));
+
+    group.bench_function("http1", |b| {
+        b.iter(|| rt.block_on(async {
+            let mut sender = http1_connect(addr).await;
+            for _ in 0..100 {
+                http1_get_heavy(&mut sender, addr, "/api/users").await;
+            }
+        }));
+    });
+
+    group.bench_function("h2c", |b| {
+        b.iter(|| rt.block_on(async {
+            let mut sender = h2c_connect(addr).await;
+            h2c_dispatch_gets_heavy(&mut sender, addr, "/api/users", 100).await;
+        }));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+
+criterion_group!(
+    benches,
+    bench_warm_latency,
+    bench_persistent,
+    bench_pool,
+    bench_pool_warm,
+    bench_heavy_headers,
+);
 criterion_main!(benches);

@@ -413,17 +413,34 @@ async fn handle_connection<L, M, S, B>(
         builder.http1().timer(TokioTimer::new());
 
         // CONNECT protocol needed for HTTP/2 websockets.
-        // Also tune flow-control windows and frame size so that h2c throughput
-        // matches HTTP/1: the default 64 KiB window causes senders to stall
-        // waiting for WINDOW_UPDATE frames, and the default 16 KiB max-frame
-        // size inflates per-byte framing overhead.
+        // Flow-control and frame-size tuning so that h2c throughput matches
+        // HTTP/1:
+        //
+        //   initial_stream/connection_window_size — the default 64 KiB window
+        //     causes senders to stall waiting for WINDOW_UPDATE frames on any
+        //     response larger than 64 KiB; 2 MiB removes that stall for typical
+        //     payloads.
+        //
+        //   max_frame_size — raising from the default 16 KiB to 1 MiB reduces
+        //     the number of DATA frames and therefore the per-byte framing
+        //     overhead.
+        //
+        //   max_send_buf_size — the send buffer must be at least as large as
+        //     the flow-control window; otherwise the h2 crate backpressures the
+        //     application before the window is even half-used.  Match it to the
+        //     connection window (2 MiB).
+        //
+        //   timer — required for HTTP/2 keep-alive PING probes (same reason
+        //     HTTP/1 needs a timer for its header-read timeout).
         #[cfg(feature = "http2")]
         builder
             .http2()
             .enable_connect_protocol()
             .initial_stream_window_size(2 * 1024 * 1024) // 2 MiB per stream
             .initial_connection_window_size(2 * 1024 * 1024) // 2 MiB per connection
-            .max_frame_size(1024 * 1024); // 1 MiB frames
+            .max_frame_size(1024 * 1024) // 1 MiB frames
+            .max_send_buf_size(2 * 1024 * 1024) // 2 MiB send buffer (matches window)
+            .timer(TokioTimer::new()); // enables keep-alive PING support
 
         let mut conn = pin!(builder.serve_connection_with_upgrades(io, hyper_service));
         let mut signal_closed = pin!(signal_tx.closed().fuse());
